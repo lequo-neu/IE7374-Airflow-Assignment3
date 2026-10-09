@@ -1,84 +1,114 @@
-# IE7374 Lab Assignment: Airflow Customer Segmentation Pipeline
+# IE7374 Lab Assignment 3: Airflow Customer Segmentation Pipeline
 
-## Overview
+[![Unit tests](https://github.com/lequo-neu/IE7374-Airflow-Assignment3/actions/workflows/unit_tests.yml/badge.svg)](https://github.com/lequo-neu/IE7374-Airflow-Assignment3/actions/workflows/unit_tests.yml)
 
-This project orchestrates a customer segmentation workflow with Apache Airflow
-running in Docker. It is based on Airflow_Labs/Lab_1 from the course repository,
-which trains a KMeans model on credit card customer data and picks the number of
-clusters with the elbow method.
+An Apache Airflow pipeline, running in Docker, that segments credit card
+customers with KMeans. Before training anything, it checks that the data is fit
+to use. It picks the number of clusters with two methods that run in parallel,
+lets a quality gate decide whether the new model is good enough to keep, and
+writes a JSON report at the end of every run, whichever way the gate went.
 
-The original lab is a straight line of four tasks. This version turns it into a
-DAG of eleven tasks that validates the data before spending any compute, runs two
-model selection methods in parallel, decides through a branching quality gate
-whether the new model is good enough to keep, and writes a JSON report at the end
-of every run regardless of which branch was taken.
+## At a Glance
 
+| What to check | Answer |
+|---|---|
+| Based on | Airflow_Labs/Lab_1 from the course repository |
+| Core concept changed | The DAG itself: from 4 tasks in a straight line to 11 tasks with a parallel fan out, a branch, and a join. See [Changes Made to the Lab](#changes-made-to-the-lab) |
+| Advanced extension | Parallel model selection with a branching quality gate. See [Advanced Extension](#advanced-extension-parallel-model-selection-with-a-branching-quality-gate) |
+| Bugs fixed from the original | 2, both in how the model was saved and used. See [Two Bugs Fixed](#two-bugs-fixed-from-the-original-lab) |
+| Proof that it works | The grid view below, the run report, and 13 unit tests shown by the badge above. See [What a Successful Run Looks Like](#what-a-successful-run-looks-like) |
+| Run it yourself | One setup script and three Docker commands. See [Running the Code](#running-the-code) |
+
+## The DAG, Before and After
+
+**Original Lab_1**
+
+```mermaid
+flowchart LR
+    a["load_data_task"] --> b["data_preprocessing_task"] --> c["build_save_model_task"] --> d["load_model_task"]
 ```
-load -> validate -> preprocess -> [elbow, silhouette] -> select_k -> quality_gate
-quality_gate -> train_final_model -> predict -> report      (silhouette >= 0.25)
-quality_gate -> quality_alert ------------------> report      (silhouette <  0.25)
+
+**This version**
+
+Yellow tasks are new. The quality gate sends each run down exactly one of the
+two branches, and the report task joins them again.
+
+```mermaid
+flowchart LR
+    load["load_data_task"] --> validate["validate_data_task"]
+    validate --> pre["preprocess_task"]
+    pre --> elbow["elbow_task"]
+    pre --> sil["silhouette_task"]
+    elbow --> sel["select_k_task"]
+    sil --> sel
+    sel --> gate{"quality_gate_task"}
+    gate -- "silhouette at or above 0.25" --> train["train_final_model_task"]
+    gate -- "silhouette below 0.25" --> alert["quality_alert_task"]
+    train --> predict["predict_task"]
+    predict --> report["report_task"]
+    alert --> report
+
+    classDef added fill:#fde68a,stroke:#b45309,color:#000000
+    class validate,sil,sel,gate,train,alert,report added
 ```
 
-![DAG run grid view](assets/dag_grid_view.png)
+![Grid view of a successful run](assets/dag_grid_view.png)
+
+In the grid view of a real run, every task is green except quality_alert_task,
+which is marked skipped because the gate chose the training branch.
 
 ## Changes Made to the Lab
 
-**DAG structure (dags/customer_segmentation_dag.py)**
+| Area | Original Lab_1 | This version |
+|---|---|---|
+| DAG shape | 4 tasks in a straight line | 11 tasks: parallel fan out, a fan in, a branch, and a join |
+| Data checks | None | Validation task stops the run on missing columns, fewer than 1,000 rows, or more than 5% nulls |
+| Choosing k | Elbow only, printed and then ignored | Elbow and silhouette in parallel, combined by an explicit rule |
+| Deciding whether to keep the model | Never, the model is always saved | Branching quality gate on the silhouette score |
+| Saved model | The last model in the loop, always k=49 | A fresh model trained with the chosen k, saved with its scaler |
+| Prediction | First test row only, on unscaled data | Every test row, with the same transformation used in training |
+| Run record | None | JSON report on every run, from either branch |
+| Retries | 0 | 1, after one minute |
+| Features | 3 columns, min max scaled | 5 columns, log transformed then standardized |
+| Tests | None | 13 unit tests, run in CI on every push |
 
-This is the main change, because the DAG itself is the core concept of the lab.
+### Tasks
 
-A validation task was added right after loading. It stops the run early if any
-required column is missing, if there are fewer than 1,000 rows, or if any feature
-has more than 5% nulls. In the original lab, bad data would only surface as a
-confusing error deep inside model training.
+| Task | Type | What it does | Runs when |
+|---|---|---|---|
+| load_data_task | Python | Reads the 8,950 customer rows | Always |
+| validate_data_task | Python | Checks columns, row count and null share, fails the run if they are off | After load |
+| preprocess_task | Python | Selects 5 features, drops nulls, log transforms and standardizes | After validation passes |
+| elbow_task | Python | Fits KMeans for k from 2 to 15 and finds the elbow of the error curve | In parallel with silhouette_task |
+| silhouette_task | Python | Scores every k from 2 to 15 for how well separated the clusters are | In parallel with elbow_task |
+| select_k_task | Python | Combines both results into one chosen k and records why | After both selection tasks |
+| quality_gate_task | Branch | Returns the next task: training if silhouette is at or above 0.25, alert if not | After select_k |
+| train_final_model_task | Python | Trains KMeans with the chosen k and saves it with its scaler | Gate passed |
+| quality_alert_task | Python | Logs a warning and keeps the previous model | Gate failed |
+| predict_task | Python | Assigns the new customers in test.csv to clusters | After training |
+| report_task | Python | Collects every result into dags/reports | Either branch, trigger rule none_failed_min_one_success |
 
-Model selection now fans out into two tasks that run at the same time. One
-computes the elbow of the SSE curve, the other computes the silhouette score for
-every k from 2 to 15. A third task fans the results back in and picks the final k.
+### How the code is organised
 
-A BranchPythonOperator acts as a quality gate. If the silhouette score at the
-chosen k is at least 0.25, the DAG continues to train and save the final model and
-then predicts clusters for new customers. If not, it takes the alert branch, logs
-a warning, and leaves the previously saved model untouched.
-
-A report task closes every run. It uses the trigger rule
-none_failed_min_one_success, so it runs whether the DAG took the training branch
-or the alert branch, and it collects the results of every upstream task into one
-JSON file under dags/reports.
-
-Default arguments were changed from zero retries to one retry with a one minute
-delay, so a transient failure does not fail the whole run.
-
-**Pipeline logic (dags/src/pipeline.py)**
-
-All task logic lives in a separate module with no Airflow imports, so each
-function can be tested with plain pytest without starting Airflow. Data still
-travels between tasks through XCom as base64 encoded pickles, the same technique
-the original lab uses.
+All task logic lives in dags/src/pipeline.py, which has no Airflow imports. The
+DAG file only wires tasks together. This split means every function can be unit
+tested with plain pytest, without starting Airflow, and the 13 tests run on
+GitHub Actions on every push. Data moves between tasks through XCom as base64
+encoded pickles, the same technique the original lab uses.
 
 The feature set grew from three columns to five: BALANCE, PURCHASES,
 CASH_ADVANCE, CREDIT_LIMIT and PAYMENTS. These amounts are heavily right skewed,
-so they are now log transformed and standardized instead of min max scaled, which
+so they are log transformed and standardized instead of min max scaled, which
 keeps a few very large accounts from dominating the distance calculation. Nulls
 are dropped only in the selected features rather than across all eighteen
 columns, which keeps more rows.
 
-**Two bugs fixed from the original lab**
+### Two Bugs Fixed from the Original Lab
 
-The original code trained KMeans for k from 1 to 49 inside a loop and saved
-whatever model was fitted last, so the saved model always had 49 clusters
-regardless of what the elbow method recommended. This version retrains a fresh
-model with the selected k and saves that one.
-
-The original code also trained on scaled data but predicted on raw, unscaled test
-data. This version saves the fitted scaler together with the model in one bundle
-and applies the exact same transformation before predicting.
-
-**Tests (test/test_pipeline.py)**
-
-Thirteen unit tests cover validation failures, preprocessing, both selection
-methods, the k selection rule, both quality gate outcomes, a full train and
-predict round trip, and report writing.
+| Bug in the original | Effect | Fix |
+|---|---|---|
+| The model saved after the loop was the last one fitted | The saved model always had 49 clusters, whatever the elbow method recommended | A separate task retrains with the chosen k and saves that model |
+| Training used scaled data but prediction used the raw test file | Predictions were made on numbers in a completely different range from the ones the model learned on | The fitted scaler is saved in the same bundle as the model and applied before predicting |
 
 ## Advanced Extension: Parallel Model Selection with a Branching Quality Gate
 
@@ -89,37 +119,37 @@ the workflow decides anything, so a poor clustering would be saved and used just
 as readily as a good one. That is the gap between a script that happens to run on
 a schedule and a pipeline that can be trusted to run unattended. In a real
 segmentation system, a model that splits customers into meaningless groups is
-worse than keeping last week's model, because downstream teams act on the
-segments.
+worse than keeping last week's model, because other teams act on the segments.
 
 The elbow method on its own is also a weak basis for that decision. It looks only
-at how much error drops as k grows and says nothing about whether the resulting
-clusters are actually well separated. Silhouette measures exactly that, but it
-can favour very small k. Using both gives a sturdier answer than either alone,
-and since they do not depend on each other, Airflow can run them side by side.
+at how much error drops as k grows and says nothing about whether the clusters
+are actually well separated. Silhouette measures exactly that, but it can favour
+very small k. Using both gives a sturdier answer than either alone, and since
+they do not depend on each other, Airflow can run them side by side.
 
 **How it works**
 
-After preprocessing, elbow_task and silhouette_task start in parallel from the
-same input. Each fits KMeans for every k from 2 to 15. select_k_task waits for
-both and applies a simple rule: keep the elbow k if its silhouette score is
-within 0.05 of the best silhouette score, otherwise switch to the silhouette
-winner. The reason for the decision is recorded alongside the result.
+| Step | Rule | Result |
+|---|---|---|
+| Select k | Silhouette at the elbow k is within 0.05 of the best silhouette | Keep the elbow k |
+| Select k | Otherwise | Switch to the k with the best silhouette |
+| Quality gate | Silhouette at the chosen k is at least 0.25 | Train, save, predict, report with status model_updated |
+| Quality gate | Silhouette below 0.25 | Alert, keep the previous model, report with status model_rejected |
 
-quality_gate_task then reads the silhouette at the chosen k and returns the id
-of the next task to run. Airflow marks the branch that was not chosen as
-skipped, and the report task still runs at the end because its trigger rule only
-requires that nothing failed and at least one upstream task succeeded.
+After preprocessing, elbow_task and silhouette_task start at the same time from
+the same input. select_k_task waits for both and records which rule it applied.
+quality_gate_task returns the id of the next task, and Airflow marks the branch
+that was not chosen as skipped. The report task still runs at the end, because
+its trigger rule only requires that nothing failed and that at least one
+upstream task succeeded.
 
 **What it produces**
 
-Every run leaves a self explanatory record in dags/reports. It shows the
-validation summary, which k each method suggested, which k was chosen and why,
-the silhouette score that the gate judged, the size of every cluster, the
-predicted clusters for new customers, and a status of either model_updated or
-model_rejected. In the Airflow grid view, a passing run shows every task green
-except quality_alert_task, which is marked skipped, so the path the run took is
-visible at a glance.
+Every run leaves a readable record in dags/reports: the validation summary, the
+k each method suggested, the k chosen and why, the silhouette score the gate
+judged, the size of every cluster, the predicted clusters for new customers, and
+a final status. In this run both methods agreed on six clusters, the silhouette
+of 0.3205 cleared the 0.25 gate, and the model was updated.
 
 ## Prerequisites
 
@@ -133,8 +163,8 @@ Python 3.10 or later, only needed to run the unit tests outside Docker. Verify
 with: python3 --version
 
 The Airflow image is apache/airflow:3.3.2, pinned as the default in
-docker-compose.yaml. The setup script tells the containers to also install
-scikit-learn and kneed when they start, so nothing needs to be installed inside
+docker-compose.yaml. The setup script tells the containers to install
+scikit-learn and kneed when they start, so nothing has to be installed inside
 Docker by hand.
 
 ## Environment Setup
@@ -198,8 +228,8 @@ Stop everything when you are done.
 docker compose down
 ```
 
-If port 8080 is already used by another program, change the host port and open
-http://localhost:8081 instead.
+If port 8080 is already in use by another program, change the host port and
+open http://localhost:8081 instead.
 
 ```
 sed -i '' 's/"8080:8080"/"8081:8080"/' docker-compose.yaml
@@ -210,17 +240,22 @@ file and can be ignored for local use.
 
 ## What a Successful Run Looks Like
 
-Running the unit tests ends with this line.
+| Check | Result |
+|---|---|
+| Unit tests | 13 passed |
+| DAG run | All 11 tasks finished in about 20 seconds, quality_alert_task skipped |
+| Rows validated | 8,950, with at most 0.01% nulls in any feature |
+| k chosen | 6, agreed by both elbow and silhouette |
+| Silhouette at k = 6 | 0.3205, above the 0.25 gate |
+| Outcome | Model updated, 3 new customers assigned to clusters 4, 0 and 2 |
+
+The unit tests end with this line.
 
 ```
 13 passed in 13.33s
 ```
 
-In the Airflow grid view, all eleven tasks are green except quality_alert_task,
-which is marked skipped because the quality gate passed. The whole run takes
-about 20 seconds.
-
-The task logs show both methods agreeing on six clusters.
+The task logs show both methods agreeing on six clusters, and the gate passing.
 
 ```
 Elbow method suggests k = 6
@@ -275,6 +310,9 @@ dags/data/test.csv. The saved model bundle appears at dags/model/kmeans_bundle.p
 
 ```
 IE7374-Airflow-Assignment3/
+    .github/
+        workflows/
+            unit_tests.yml              (runs the 13 unit tests on every push)
     assets/
         dag_grid_view.png
     dags/
